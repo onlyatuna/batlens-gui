@@ -1,0 +1,12 @@
+[package]
+name = "batlens-gui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Evan Chen <evanchen940628@gmail.com>"]
+description = "Windows laptop battery tray tool"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+batlens-core = { git = "https://github.com/onlyatuna/batlens-core", rev = "eba4e07" }

@@ -1,0 +1,10 @@
+/target/
+*.exe
+*.pdb
+*.tmp
+*.tmp.*
+.design_capacity
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
