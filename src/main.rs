@@ -362,6 +362,15 @@ unsafe extern "system" fn power_wnd_proc(
     }
 }
 
+fn fmt_eta(h: f64) -> String {
+    if h <= 36.0 {
+        let m = (h * 60.0).round() as u64;
+        format!("{}h {:02}m", m / 60, m % 60)
+    } else {
+        "> 36 h".to_string()
+    }
+}
+
 #[derive(Clone, Default)]
 struct DisplayData {
     percent: Option<u32>,
@@ -389,13 +398,20 @@ impl DisplayData {
             .then(|| (s.full_mwh * 100 / s.design_mwh).max(0) as u32);
         let health = health_pct.map_or("N/A".to_string(), |h| format!("{h}%"));
         let time_left = if s.dis_w >= 0.1 && s.percent.is_some() {
-            let h = s.remaining_mwh as f64 / 1000.0 / s.dis_w;
-            if h <= 36.0 {
-                let m = (h * 60.0).round() as u64;
-                format!("{}h {:02}m", m / 60, m % 60)
+            fmt_eta(s.remaining_mwh as f64 / 1000.0 / s.dis_w)
+        } else if s.ac
+            && s.rate_mw >= 100
+            && s.full_mwh > s.remaining_mwh
+            && let Some(p) = s.percent
+        {
+            let target_80 = s.full_mwh * 80 / 100;
+            let (target_mwh, tag) = if p < 80 && s.remaining_mwh < target_80 {
+                (target_80, "80%")
             } else {
-                "> 36 h".to_string()
-            }
+                (s.full_mwh, "100%")
+            };
+            let h = (target_mwh - s.remaining_mwh) as f64 / s.rate_mw as f64;
+            format!("{} ({tag})", fmt_eta(h))
         } else {
             "N/A".to_string()
         };
