@@ -10,3 +10,14 @@ readme = "README.md"
 
 [dependencies]
 batlens-core = { git = "https://github.com/onlyatuna/batlens-core", rev = "eba4e07" }
+ferrokit-core = { git = "https://github.com/onlyatuna/ferrokit", rev = "75ef724" }
+ferrokit-platform = { git = "https://github.com/onlyatuna/ferrokit", rev = "75ef724" }
+ferrokit-gui = { git = "https://github.com/onlyatuna/ferrokit", rev = "75ef724" }
+ferrokit-widgets = { git = "https://github.com/onlyatuna/ferrokit", rev = "75ef724" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
