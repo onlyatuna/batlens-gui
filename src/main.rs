@@ -1,67 +1,84 @@
 // SPDX-License-Identifier: MIT
-//! Tray icon and popup panel showing battery power, health, capacity and time left.
+//! Tray icon and popup panel showing battery power, health, wear rate, capacity and time left.
 
 #![windows_subsystem = "windows"]
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
-use std::rc::Rc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::ptr;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use batlens_core::types::{Report, Sample};
-use ferrokit_core::event::{Event, EventKind};
-use ferrokit_core::object::{ObjectData, ObjectId, QObject, register_owned_qobject};
-use ferrokit_core::timer::Timer;
-use ferrokit_gui::application::GuiApplication;
-use ferrokit_gui::geometry::primitives::{Point, PointF, Rect, RectF};
-use ferrokit_gui::image::Icon;
-use ferrokit_gui::paint::{Painter, Pixmap};
-use ferrokit_gui::text::{Font, FontMetrics, FontWeight};
-use ferrokit_gui::tiny_skia::Color;
-use ferrokit_platform::WindowFlags;
-use ferrokit_widgets::FocusPolicy;
-use ferrokit_widgets::action::{ActionGroup, ActionRef};
-use ferrokit_widgets::application::Application;
-use ferrokit_widgets::menu::{Menu, MenuRef};
-use ferrokit_widgets::system_tray::{ActivationReason, MessageIcon, SystemTrayIcon};
-use ferrokit_widgets::widget::{EmptyWidget, Widget, WidgetRef};
-use ferrokit_widgets::window::Window;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE as WIN_SIZE, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CreateBitmap,
+    CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
+    DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_RIGHT, DT_SINGLELINE, DeleteDC, DeleteObject, DrawTextW,
+    EndPaint, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, FillRect, GetDC, GetMonitorInfoW,
+    GetTextExtentPoint32W, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
+};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Power::RegisterPowerSettingNotification;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows_sys::Win32::System::SystemServices::GUID_ACDC_POWER_SOURCE;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, GWLP_WNDPROC, PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC,
-    PBT_POWERSETTINGCHANGE, PostMessageW, SetForegroundWindow, SetWindowLongPtrW, WM_APP,
-    WM_POWERBROADCAST,
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-const POLL_MS: u64 = 30_000;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows_sys::Win32::UI::Shell::{
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+    NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CS_HREDRAW, CS_VREDRAW, CheckMenuRadioItem, CreateIconIndirect, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetClientRect,
+    GetCursorPos, GetMessageW, HICON, ICONINFO, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
+    MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, PM_NOREMOVE,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos,
+    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenuEx, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_NULL, WM_PAINT, WM_POWERBROADCAST,
+    WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+const POLL_MS: u32 = 30_000;
+const SETTLE_MS: u32 = 800;
 const LOW_PERCENT: u32 = 20;
-/// Icon edge in pixels. Larger than the 16 px base so Windows scales it down at high DPI.
-const SIZE: usize = 32;
+const ICON_PX: usize = 32;
 const PANEL_W: i32 = 236;
+const TRAY_UID: u32 = 1;
+
+const TIMER_SETTLE: usize = 2;
+
+const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
+const WM_APP_DATA_READY: u32 = WM_APP + 2;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
+
+const CMD_ICON_CHARGE: u32 = 1001;
+const CMD_ICON_HEALTH: u32 = 1002;
+const CMD_AUTOSTART: u32 = 1003;
+const CMD_QUIT: u32 = 1004;
 
 const APP_KEY: &str = "Software\\batlens-gui";
 const ICON_MODE_VAL: &str = "IconMode";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_VAL: &str = "batlens-gui";
 
-const WM_APP_WEAR_READY: u32 = WM_APP + 1;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-static WEAR_TEXT: OnceLock<String> = OnceLock::new();
-static ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
-
-thread_local! {
-    static EVENT_TIMERS: RefCell<Option<(Timer, Timer)>> = const { RefCell::new(None) };
-}
 /// 3x5 digit glyphs, one row per entry, bit 2 is the left column.
 const DIGITS: [[u8; 5]; 10] = [
     [7, 5, 5, 5, 7],
@@ -76,10 +93,23 @@ const DIGITS: [[u8; 5]; 10] = [
     [7, 5, 7, 1, 7],
 ];
 
+static WEAR_TEXT: OnceLock<String> = OnceLock::new();
+static LATEST_DATA: Mutex<Option<DisplayData>> = Mutex::new(None);
+static POLL_WAKE: OnceLock<SyncSender<()>> = OnceLock::new();
+
+fn wake_worker() {
+    if let Some(tx) = POLL_WAKE.get() {
+        let _ = tx.try_send(());
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IconMode {
     Charge = 0,
     Health = 1,
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -89,10 +119,37 @@ fn wide(s: &str) -> Vec<u16> {
         .collect()
 }
 
+fn copy_wide_trunc(dst: &mut [u16], s: &str) {
+    dst.fill(0);
+    let max = dst.len().saturating_sub(1);
+    for (i, u) in OsStr::new(s).encode_wide().take(max).enumerate() {
+        dst[i] = u;
+    }
+}
+
+fn enable_dark_menus() {
+    let lib_name = wide("uxtheme.dll");
+    // SAFETY: Loading system `uxtheme.dll` and resolving undocumented dark-mode ordinals 135/136.
+    unsafe {
+        let hmod = LoadLibraryW(lib_name.as_ptr());
+        if hmod.is_null() {
+            return;
+        }
+        if let Some(p) = GetProcAddress(hmod, 135usize as *const u8) {
+            let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(p);
+            set_mode(2); // ForceDark
+        }
+        if let Some(p) = GetProcAddress(hmod, 136usize as *const u8) {
+            let flush: unsafe extern "system" fn() = std::mem::transmute(p);
+            flush();
+        }
+    }
+}
+
 fn load_icon_mode() -> IconMode {
     let subkey = wide(APP_KEY);
     let name = wide(ICON_MODE_VAL);
-    let mut hkey: HKEY = std::ptr::null_mut();
+    let mut hkey: HKEY = ptr::null_mut();
     // SAFETY: `subkey` is NUL-terminated UTF-16 and `hkey` is a valid out-pointer.
     let st = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
     if st != ERROR_SUCCESS {
@@ -101,18 +158,18 @@ fn load_icon_mode() -> IconMode {
     let mut val = 0u32;
     let mut ty = 0u32;
     let mut len = std::mem::size_of::<u32>() as u32;
-    // SAFETY: `hkey` is an open key, `name` is NUL-terminated, and `val`/`len` match `u32`.
+    // SAFETY: `hkey` is open, `name` is NUL-terminated, and `val`/`len` match `u32`.
     let st = unsafe {
         RegQueryValueExW(
             hkey,
             name.as_ptr(),
-            std::ptr::null_mut(),
+            ptr::null_mut(),
             &mut ty,
             (&raw mut val).cast(),
             &mut len,
         )
     };
-    // SAFETY: `hkey` was opened above and is not used after this close.
+    // SAFETY: `hkey` was opened above and is not used after closing.
     unsafe { RegCloseKey(hkey) };
     if st == ERROR_SUCCESS && ty == REG_DWORD && val == 1 {
         IconMode::Health
@@ -124,19 +181,19 @@ fn load_icon_mode() -> IconMode {
 fn save_icon_mode(mode: IconMode) {
     let subkey = wide(APP_KEY);
     let name = wide(ICON_MODE_VAL);
-    let mut hkey: HKEY = std::ptr::null_mut();
+    let mut hkey: HKEY = ptr::null_mut();
     // SAFETY: `subkey` is NUL-terminated UTF-16 and `hkey` is a valid out-pointer.
     let st = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             0,
-            std::ptr::null(),
+            ptr::null(),
             REG_OPTION_NON_VOLATILE,
             KEY_SET_VALUE,
-            std::ptr::null(),
+            ptr::null(),
             &mut hkey,
-            std::ptr::null_mut(),
+            ptr::null_mut(),
         )
     };
     if st != ERROR_SUCCESS {
@@ -160,7 +217,7 @@ fn save_icon_mode(mode: IconMode) {
 fn is_autostart_enabled() -> bool {
     let subkey = wide(RUN_KEY);
     let name = wide(RUN_VAL);
-    let mut hkey: HKEY = std::ptr::null_mut();
+    let mut hkey: HKEY = ptr::null_mut();
     // SAFETY: `subkey` is NUL-terminated UTF-16 and `hkey` is a valid out-pointer.
     let st = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
     if st != ERROR_SUCCESS {
@@ -173,13 +230,13 @@ fn is_autostart_enabled() -> bool {
         RegQueryValueExW(
             hkey,
             name.as_ptr(),
-            std::ptr::null_mut(),
+            ptr::null_mut(),
             &mut ty,
-            std::ptr::null_mut(),
+            ptr::null_mut(),
             &mut len,
         )
     };
-    // SAFETY: `hkey` was opened above and is not used after this close.
+    // SAFETY: `hkey` was opened above and is not used after closing.
     unsafe { RegCloseKey(hkey) };
     st == ERROR_SUCCESS && ty == REG_SZ && len > 2
 }
@@ -187,7 +244,7 @@ fn is_autostart_enabled() -> bool {
 fn set_autostart(enabled: bool) {
     let subkey = wide(RUN_KEY);
     let name = wide(RUN_VAL);
-    let mut hkey: HKEY = std::ptr::null_mut();
+    let mut hkey: HKEY = ptr::null_mut();
     // SAFETY: `subkey` is NUL-terminated UTF-16 and `hkey` is a valid out-pointer.
     let st = unsafe {
         RegOpenKeyExW(
@@ -222,23 +279,21 @@ fn set_autostart(enabled: bool) {
             RegDeleteValueW(hkey, name.as_ptr());
         }
     }
-    // SAFETY: `hkey` was opened above and is not used after this close.
+    // SAFETY: `hkey` was opened above and is not used after closing.
     unsafe { RegCloseKey(hkey) };
 }
 
-fn put(data: &mut [u8], x: usize, y: usize, rgb: [u8; 3]) {
-    let i = (y * SIZE + x) * 4;
-    data[i..i + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+fn put_bgra(data: &mut [u8], x: usize, y: usize, rgb_val: [u8; 3]) {
+    let i = (y * ICON_PX + x) * 4;
+    data[i..i + 4].copy_from_slice(&[rgb_val[2], rgb_val[1], rgb_val[0], 255]);
 }
 
-/// 32x32 icon: a coloured square with two digits (100 shows as 99).
-fn make_icon(value: Option<u32>, bg: [u8; 3]) -> Icon {
-    let mut pm = Pixmap::new(SIZE as u32, SIZE as u32).expect("icon pixmap");
-    let data = pm.data_mut();
-    data.fill(0);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            put(data, x, y, bg);
+/// Creates a 32x32 `HICON` with a coloured square and two 3x5 digits (100 shows as 99).
+fn make_hicon(value: Option<u32>, bg: [u8; 3]) -> HICON {
+    let mut bgra = [0u8; ICON_PX * ICON_PX * 4];
+    for y in 0..ICON_PX {
+        for x in 0..ICON_PX {
+            put_bgra(&mut bgra, x, y, bg);
         }
     }
     if let Some(p) = value {
@@ -247,58 +302,78 @@ fn make_icon(value: Option<u32>, bg: [u8; 3]) -> Icon {
             for (row, bits) in DIGITS[d].iter().enumerate() {
                 for col in 0..3 {
                     if bits >> (2 - col) & 1 == 1 {
-                        // Each glyph pixel is 4x4; glyphs start at x = 2 and x = 18.
                         for (dx, dy) in (0..4).flat_map(|a| (0..4).map(move |b| (a, b))) {
-                            put(data, 2 + n * 16 + col * 4 + dx, 6 + row * 4 + dy, [255; 3]);
+                            put_bgra(
+                                &mut bgra,
+                                2 + n * 16 + col * 4 + dx,
+                                6 + row * 4 + dy,
+                                [255; 3],
+                            );
                         }
                     }
                 }
             }
         }
     }
-    Icon::from_pixmap(&pm)
-}
 
-fn load_wear_report() -> Option<Report> {
-    let out = batlens_core::xml::get_report_cache_path();
-    let fresh = std::fs::metadata(&out)
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().is_ok_and(|d| d.as_secs() < 3600));
-    if fresh
-        && let Ok(xml) = batlens_core::xml::read_xml_string(&out)
-        && let Ok(rep) = batlens_core::xml::parse_report(&xml)
-    {
-        return Some(rep);
-    }
-    let tmp = out.with_extension(format!("tmp.{}.xml", std::process::id()));
-    let status = std::process::Command::new(batlens_core::xml::get_powercfg_path())
-        .args(["/batteryreport", "/xml", "/output"])
-        .arg(&tmp)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        let xml = batlens_core::xml::read_xml_string(&out).ok()?;
-        return batlens_core::xml::parse_report(&xml).ok();
-    }
-    let xml = batlens_core::xml::read_xml_string(&tmp).ok();
-    if std::fs::rename(&tmp, &out).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    let xml = match xml {
-        Some(x) => x,
-        None => batlens_core::xml::read_xml_string(&out).ok()?,
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: ICON_PX as i32,
+            biHeight: -(ICON_PX as i32), // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
     };
-    batlens_core::xml::parse_report(&xml).ok()
+    let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+    // SAFETY: Creating a 32x32 32-bit DIB section, copying `bgra` into `bits`, creating a 1-bit mask
+    // bitmap, calling `CreateIconIndirect`, and deleting both temporary bitmaps before returning.
+    unsafe {
+        let hbm_color = CreateDIBSection(
+            ptr::null_mut(),
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            ptr::null_mut(),
+            0,
+        );
+        if hbm_color.is_null() || bits.is_null() {
+            if !hbm_color.is_null() {
+                DeleteObject(hbm_color);
+            }
+            return ptr::null_mut();
+        }
+        ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
+        let mask_bytes = [0u8; (ICON_PX / 8) * ICON_PX];
+        let hbm_mask = CreateBitmap(
+            ICON_PX as i32,
+            ICON_PX as i32,
+            1,
+            1,
+            mask_bytes.as_ptr().cast(),
+        );
+        let ii = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: hbm_mask,
+            hbmColor: hbm_color,
+        };
+        let hicon = CreateIconIndirect(&ii);
+        if !hbm_mask.is_null() {
+            DeleteObject(hbm_mask);
+        }
+        DeleteObject(hbm_color);
+        hicon
+    }
 }
 
-fn compute_wear_text() -> Option<String> {
-    let r = load_wear_report()?;
-    batlens_core::xml::update_design_capacity_cache_from_report(&r);
-    let pts = batlens_core::stats::clean_history(&r);
+fn wear_from_report(r: &Report) -> Option<String> {
+    batlens_core::xml::update_design_capacity_cache_from_report(r);
+    let pts = batlens_core::stats::clean_history(r);
     if pts.is_empty() {
         return None;
     }
@@ -323,43 +398,46 @@ fn compute_wear_text() -> Option<String> {
     }
 }
 
-unsafe extern "system" fn power_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if msg == WM_POWERBROADCAST {
-        let wp = wparam as u32;
-        if wp == PBT_APMPOWERSTATUSCHANGE
-            || wp == PBT_POWERSETTINGCHANGE
-            || wp == PBT_APMRESUMEAUTOMATIC
-        {
-            EVENT_TIMERS.with(|cell| {
-                if let Some((fast, settle)) = cell.borrow().as_ref() {
-                    fast.start_with_interval(0);
-                    settle.start_with_interval(800);
-                }
-            });
-        }
-    } else if msg == WM_APP_WEAR_READY {
-        EVENT_TIMERS.with(|cell| {
-            if let Some((fast, _)) = cell.borrow().as_ref() {
-                fast.start_with_interval(0);
-            }
-        });
-        return 0;
+fn try_cached_wear_text() -> Option<String> {
+    let out = batlens_core::xml::get_report_cache_path();
+    let fresh = std::fs::metadata(&out)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|d| d.as_secs() < 3600));
+    if !fresh {
+        return None;
     }
-    let orig = ORIG_WNDPROC.load(Ordering::Relaxed);
-    if orig != 0 {
-        // SAFETY: `orig` is the previous window procedure returned by `SetWindowLongPtrW`.
-        let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
-            unsafe { std::mem::transmute(orig) };
-        // SAFETY: Forwarding message parameters to the original window procedure.
-        unsafe { CallWindowProcW(Some(proc), hwnd, msg, wparam, lparam) }
-    } else {
-        0
+    let xml = batlens_core::xml::read_xml_string(&out).ok()?;
+    let rep = batlens_core::xml::parse_report(&xml).ok()?;
+    wear_from_report(&rep)
+}
+
+fn generate_wear_text() -> Option<String> {
+    let out = batlens_core::xml::get_report_cache_path();
+    let tmp = out.with_extension(format!("tmp.{}.xml", std::process::id()));
+    let status = std::process::Command::new(batlens_core::xml::get_powercfg_path())
+        .args(["/batteryreport", "/xml", "/output"])
+        .arg(&tmp)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        let xml = batlens_core::xml::read_xml_string(&out).ok()?;
+        let rep = batlens_core::xml::parse_report(&xml).ok()?;
+        return wear_from_report(&rep);
     }
+    let xml = batlens_core::xml::read_xml_string(&tmp).ok();
+    if std::fs::rename(&tmp, &out).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let xml = match xml {
+        Some(x) => x,
+        None => batlens_core::xml::read_xml_string(&out).ok()?,
+    };
+    let rep = batlens_core::xml::parse_report(&xml).ok()?;
+    wear_from_report(&rep)
 }
 
 fn fmt_eta(h: f64) -> String {
@@ -459,177 +537,348 @@ impl DisplayData {
     }
 }
 
-fn paint_panel(painter: &mut Painter, data: &DisplayData) {
-    let w = PANEL_W as f32;
-    let h = data.panel_height() as f32;
-    let border = Color::from_rgba8(62, 62, 66, 255);
-    let bg = Color::from_rgba8(32, 32, 32, 255);
-    painter.fill_rect(RectF::new(0.0, 0.0, w, h), border);
-    painter.fill_rect(RectF::new(1.0, 1.0, w - 2.0, h - 2.0), bg);
+fn fill_solid(hdc: HDC, r: RECT, color: u32) {
+    // SAFETY: `hdc` is a valid device context; brush is created, used for `FillRect`, and deleted.
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        FillRect(hdc, &r, brush);
+        DeleteObject(brush);
+    }
+}
 
-    let pad = 16.0;
-    let mut big_font = Font::new("Segoe UI", 32.0);
-    big_font.set_weight(FontWeight::Bold);
-    let big_metrics = FontMetrics::from_font(&big_font);
+fn make_font(px_height: i32, weight: i32) -> HFONT {
+    let face = wide("Segoe UI");
+    // SAFETY: `face` is NUL-terminated UTF-16; returns a GDI font handle owned by caller.
+    unsafe {
+        CreateFontW(
+            -px_height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            1, // DEFAULT_CHARSET
+            0,
+            0,
+            CLEARTYPE_QUALITY as u32,
+            0,
+            face.as_ptr(),
+        )
+    }
+}
 
-    let mut state_font = Font::new("Segoe UI", 13.0);
-    state_font.set_weight(FontWeight::SemiBold);
+fn draw_text(hdc: HDC, text: &str, mut rect: RECT, flags: u32, color: u32) {
+    let w: Vec<u16> = OsStr::new(text).encode_wide().collect();
+    // SAFETY: `hdc` is valid and `w` is valid for `w.len()` UTF-16 code units.
+    unsafe {
+        SetTextColor(hdc, color);
+        DrawTextW(hdc, w.as_ptr(), w.len() as i32, &mut rect, flags);
+    }
+}
 
-    let label_font = Font::new("Segoe UI", 13.0);
-    let mut val_font = Font::new("Segoe UI", 13.0);
-    val_font.set_weight(FontWeight::SemiBold);
-    let val_metrics = FontMetrics::from_font(&val_font);
+fn text_size(hdc: HDC, text: &str) -> WIN_SIZE {
+    let w: Vec<u16> = OsStr::new(text).encode_wide().collect();
+    let mut sz = WIN_SIZE { cx: 0, cy: 0 };
+    // SAFETY: `hdc` is valid and `w` holds `w.len()` UTF-16 code units.
+    unsafe {
+        GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz);
+    }
+    sz
+}
 
-    let white = Color::from_rgba8(244, 244, 246, 255);
-    let dim = Color::from_rgba8(154, 154, 154, 255);
-    let val_color = Color::from_rgba8(240, 240, 240, 255);
+fn paint_panel_gdi(hdc: HDC, width: i32, height: i32, scale: f32, data: &DisplayData) {
+    let s = |v: f32| (v * scale).round() as i32;
+    let b = s(1.0).max(1);
+    fill_solid(
+        hdc,
+        RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        rgb(62, 62, 66),
+    );
+    fill_solid(
+        hdc,
+        RECT {
+            left: b,
+            top: b,
+            right: width - b,
+            bottom: height - b,
+        },
+        rgb(32, 32, 32),
+    );
+
+    let pad = s(16.0);
+    let big_font = make_font(s(32.0), FW_BOLD as i32);
+    let semi_font = make_font(s(13.0), FW_SEMIBOLD as i32);
+    let reg_font = make_font(s(13.0), FW_NORMAL as i32);
+
+    let white = rgb(244, 244, 246);
+    let dim = rgb(154, 154, 154);
+    let val_color = rgb(240, 240, 240);
     let low = !data.ac && data.percent.is_some_and(|p| p <= LOW_PERCENT);
     let accent = if data.ac {
-        Color::from_rgba8(74, 222, 128, 255)
+        rgb(74, 222, 128)
     } else if low {
-        Color::from_rgba8(251, 146, 60, 255)
+        rgb(251, 146, 60)
     } else {
-        Color::from_rgba8(180, 188, 198, 255)
+        rgb(180, 188, 198)
     };
 
-    let header_y = 46.0;
-    painter.draw_text_colored(PointF::new(pad, header_y), &data.pct_text, &big_font, white);
-    let pct_w = big_metrics.horizontal_advance_exact(&data.pct_text, &big_font);
-    painter.draw_text_colored(
-        PointF::new((pad + pct_w + 10.0).round(), header_y),
-        data.state_text,
-        &state_font,
-        accent,
-    );
+    // SAFETY: Selecting created fonts into `hdc`, drawing text, and restoring/deleting all GDI fonts.
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT as i32);
 
-    let bar_w = w - pad * 2.0;
-    let bar_y = 58.0;
-    let bar_h = 6.0;
-    painter.fill_rect(
-        RectF::new(pad, bar_y, bar_w, bar_h),
-        Color::from_rgba8(56, 56, 60, 255),
-    );
-    if let Some(p) = data.percent {
-        let fill_w = (bar_w * (p.min(100) as f32 / 100.0)).round();
-        if fill_w > 0.0 {
-            let bar_color = if data.ac {
-                Color::from_rgba8(52, 211, 153, 255)
-            } else if low {
-                Color::from_rgba8(239, 68, 68, 255)
-            } else {
-                Color::from_rgba8(56, 189, 248, 255)
+        let old = SelectObject(hdc, big_font);
+        let pct_sz = text_size(hdc, &data.pct_text);
+        let top_y = s(10.0);
+        draw_text(
+            hdc,
+            &data.pct_text,
+            RECT {
+                left: pad,
+                top: top_y,
+                right: width - pad,
+                bottom: top_y + pct_sz.cy,
+            },
+            DT_LEFT | DT_SINGLELINE | DT_NOCLIP,
+            white,
+        );
+
+        SelectObject(hdc, semi_font);
+        let state_sz = text_size(hdc, data.state_text);
+        let state_x = pad + pct_sz.cx + s(10.0);
+        let state_y = top_y + pct_sz.cy - state_sz.cy - s(5.0);
+        draw_text(
+            hdc,
+            data.state_text,
+            RECT {
+                left: state_x,
+                top: state_y,
+                right: width - pad,
+                bottom: state_y + state_sz.cy,
+            },
+            DT_LEFT | DT_SINGLELINE | DT_NOCLIP,
+            accent,
+        );
+
+        let bar_y = s(58.0);
+        let bar_h = s(6.0).max(2);
+        let bar_w = width - pad * 2;
+        fill_solid(
+            hdc,
+            RECT {
+                left: pad,
+                top: bar_y,
+                right: pad + bar_w,
+                bottom: bar_y + bar_h,
+            },
+            rgb(56, 56, 60),
+        );
+        if let Some(p) = data.percent {
+            let fill_w = ((bar_w as f32) * (p.min(100) as f32 / 100.0)).round() as i32;
+            if fill_w > 0 {
+                let bar_color = if data.ac {
+                    rgb(52, 211, 153)
+                } else if low {
+                    rgb(239, 68, 68)
+                } else {
+                    rgb(56, 189, 248)
+                };
+                fill_solid(
+                    hdc,
+                    RECT {
+                        left: pad,
+                        top: bar_y,
+                        right: pad + fill_w,
+                        bottom: bar_y + bar_h,
+                    },
+                    bar_color,
+                );
+            }
+        }
+
+        let mut rows: Vec<(&str, &str)> = vec![("Power", &data.power), ("Health", &data.health)];
+        if let Some(wear) = &data.wear {
+            rows.push(("Wear", wear));
+        }
+        rows.push(("Time left", &data.time_left));
+        if let Some(cap) = &data.capacity {
+            rows.push(("Capacity", cap));
+        }
+        for (i, (label, value)) in rows.into_iter().enumerate() {
+            let y = s(76.0 + i as f32 * 26.0);
+            let row_rect = RECT {
+                left: pad,
+                top: y,
+                right: width - pad,
+                bottom: y + s(22.0),
             };
-            painter.fill_rect(RectF::new(pad, bar_y, fill_w, bar_h), bar_color);
+            SelectObject(hdc, reg_font);
+            draw_text(
+                hdc,
+                label,
+                row_rect,
+                DT_LEFT | DT_SINGLELINE | DT_NOCLIP,
+                dim,
+            );
+            SelectObject(hdc, semi_font);
+            draw_text(
+                hdc,
+                value,
+                row_rect,
+                DT_RIGHT | DT_SINGLELINE | DT_NOCLIP,
+                val_color,
+            );
         }
-    }
 
-    let mut rows: Vec<(&str, &str)> = vec![("Power", &data.power), ("Health", &data.health)];
-    if let Some(wear) = &data.wear {
-        rows.push(("Wear", wear));
-    }
-    rows.push(("Time left", &data.time_left));
-    if let Some(cap) = &data.capacity {
-        rows.push(("Capacity", cap));
-    }
-    for (i, (label, value)) in rows.into_iter().enumerate() {
-        let y = 92.0 + i as f32 * 26.0;
-        painter.draw_text_colored(PointF::new(pad, y), label, &label_font, dim);
-        let vw = val_metrics.horizontal_advance_exact(value, &val_font);
-        let vx = (w - pad - vw).round().max(pad + 72.0);
-        painter.draw_text_colored(PointF::new(vx, y), value, &val_font, val_color);
+        SelectObject(hdc, old);
+        DeleteObject(big_font);
+        DeleteObject(semi_font);
+        DeleteObject(reg_font);
     }
 }
 
-struct EscFilter {
-    data: ObjectData,
-    hide_timer: Timer,
-}
-
-impl QObject for EscFilter {
-    fn object_data(&self) -> &ObjectData {
-        &self.data
-    }
-
-    fn object_data_mut(&mut self) -> ferrokit_core::object::ObjectDataMut<'_> {
-        ferrokit_core::object::ObjectDataMut::new(&mut self.data)
-    }
-
-    fn event(&mut self, _event: &mut Event) -> bool {
-        false
-    }
-
-    fn event_filter(&mut self, _watched: ObjectId, event: &mut Event) -> bool {
-        if let EventKind::KeyPress { key, .. } = event.kind
-            && (key == 0x1B || key == 0x0100_0000)
-        {
-            self.hide_timer.start_with_interval(0);
-            return true;
-        }
-        false
-    }
-}
-
-struct Tray {
-    icon: SystemTrayIcon,
-    panel: Rc<RefCell<Window>>,
-    data: Rc<RefCell<DisplayData>>,
-    last_deactivate: Rc<Cell<Option<Instant>>>,
+struct AppState {
+    hwnd: HWND,
+    hicon: HICON,
+    last_icon_spec: Option<(Option<u32>, [u8; 3])>,
+    last_tip: String,
+    data: DisplayData,
     icon_mode: IconMode,
     warned: bool,
+    last_deactivate: Option<Instant>,
+    taskbar_created_msg: u32,
 }
 
-impl Tray {
-    fn update_icon(&mut self, d: &DisplayData) {
-        let (val, bg) = match self.icon_mode {
+thread_local! {
+    static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+}
+
+impl AppState {
+    fn current_icon_spec(&self) -> (Option<u32>, [u8; 3]) {
+        match self.icon_mode {
             IconMode::Charge => {
-                let bg = match d.percent {
+                let bg = match self.data.percent {
                     None => [90, 90, 90],
-                    Some(_) if d.ac => [30, 140, 60],
+                    Some(_) if self.data.ac => [30, 140, 60],
                     Some(p) if p <= LOW_PERCENT => [190, 40, 40],
                     Some(_) => [60, 60, 60],
                 };
-                (d.percent, bg)
+                (self.data.percent, bg)
             }
             IconMode::Health => {
-                let bg = if d.health_pct.is_some() {
+                let bg = if self.data.health_pct.is_some() {
                     [55, 85, 115]
                 } else {
                     [90, 90, 90]
                 };
-                (d.health_pct, bg)
+                (self.data.health_pct, bg)
             }
-        };
-        let _ = self.icon.set_icon(&make_icon(val, bg));
+        }
     }
 
-    fn refresh(&mut self) {
-        let Ok(s) = batlens_core::sys::sample() else {
+    fn base_nid(&self) -> NOTIFYICONDATAW {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_UID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+            uCallbackMessage: WM_TRAY_CALLBACK,
+            hIcon: self.hicon,
+            ..Default::default()
+        };
+        copy_wide_trunc(&mut nid.szTip, &self.data.tooltip());
+        nid
+    }
+
+    fn add_tray_icon(&mut self) {
+        let spec = self.current_icon_spec();
+        let new_icon = make_hicon(spec.0, spec.1);
+        if !new_icon.is_null() {
+            if !self.hicon.is_null() {
+                // SAFETY: `self.hicon` was created by `CreateIconIndirect` and is replaced here.
+                unsafe { DestroyIcon(self.hicon) };
+            }
+            self.hicon = new_icon;
+            self.last_icon_spec = Some(spec);
+        }
+        self.last_tip = self.data.tooltip();
+        let mut nid = self.base_nid();
+        // SAFETY: `nid` is initialized with `cbSize` and valid handles for `NIM_ADD`/`NIM_SETVERSION`.
+        unsafe {
+            Shell_NotifyIconW(NIM_ADD, &nid);
+            nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        }
+    }
+
+    fn update_tray(&mut self, balloon: Option<(&str, &str)>) {
+        let spec = self.current_icon_spec();
+        let tip = self.data.tooltip();
+        let icon_changed = self.last_icon_spec != Some(spec);
+        let tip_changed = self.last_tip != tip;
+        if !icon_changed && !tip_changed && balloon.is_none() {
+            return;
+        }
+        if icon_changed {
+            let new_icon = make_hicon(spec.0, spec.1);
+            if !new_icon.is_null() {
+                if !self.hicon.is_null() {
+                    // SAFETY: Destroying the previous icon after creating the replacement.
+                    unsafe { DestroyIcon(self.hicon) };
+                }
+                self.hicon = new_icon;
+                self.last_icon_spec = Some(spec);
+            }
+        }
+        self.last_tip = tip;
+        let mut nid = self.base_nid();
+        if !icon_changed {
+            nid.uFlags &= !NIF_ICON;
+        }
+        if let Some((title, body)) = balloon {
+            nid.uFlags |= NIF_INFO;
+            nid.dwInfoFlags = NIIF_WARNING;
+            copy_wide_trunc(&mut nid.szInfoTitle, title);
+            copy_wide_trunc(&mut nid.szInfo, body);
+        }
+        // SAFETY: `nid` is a valid `NOTIFYICONDATAW` for `NIM_MODIFY`.
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    fn remove_tray(&mut self) {
+        let nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_UID,
+            ..Default::default()
+        };
+        // SAFETY: Removing our tray icon and freeing `self.hicon` on shutdown.
+        unsafe {
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            if !self.hicon.is_null() {
+                DestroyIcon(self.hicon);
+                self.hicon = ptr::null_mut();
+            }
+        }
+    }
+
+    fn apply_latest_data(&mut self) {
+        let Some(d) = LATEST_DATA.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
         };
-        let d = DisplayData::from_sample(&s);
-        self.update_icon(&d);
-        let _ = self.icon.set_tooltip(d.tooltip());
-
         let low = !d.ac && d.percent.is_some_and(|p| p <= LOW_PERCENT);
-        if low && !self.warned {
-            let _ = self.icon.show_message(
-                "Battery low",
-                &format!("{} ({})", d.pct_text, d.state_text),
-                MessageIcon::Warning,
-                5000,
-            );
-        }
+        let msg = (low && !self.warned).then(|| format!("{} ({})", d.pct_text, d.state_text));
         self.warned = low;
-
-        let h = d.panel_height();
-        *self.data.borrow_mut() = d;
-        if let Ok(mut win) = self.panel.try_borrow_mut()
-            && win.is_visible()
-        {
-            let rect = self.panel_rect(h);
-            win.set_geometry(rect);
-            win.render_and_present();
-        }
+        self.data = d;
+        self.update_tray(msg.as_deref().map(|b| ("Battery low", b)));
     }
 
     fn set_icon_mode(&mut self, mode: IconMode) {
@@ -638,282 +887,564 @@ impl Tray {
         }
         self.icon_mode = mode;
         save_icon_mode(mode);
-        let d = self.data.borrow().clone();
-        self.update_icon(&d);
+        self.update_tray(None);
     }
 
-    fn panel_rect(&self, panel_h: i32) -> Rect {
-        let icon_rect = self.icon.geometry();
-        let platform = ferrokit_platform::platform();
-        let center = Point::new(
-            icon_rect.x + icon_rect.width / 2,
-            icon_rect.y + icon_rect.height / 2,
-        );
-        let work = platform
-            .screens()
-            .into_iter()
-            .find(|s| s.geometry().contains(center))
-            .unwrap_or_else(|| platform.primary_screen())
-            .available_geometry();
-        const MARGIN: i32 = 8;
-        const GAP: i32 = 6;
-        let (mut x, mut y) = if icon_rect.width > 0 && icon_rect.height > 0 {
-            let x = icon_rect.x + (icon_rect.width - PANEL_W) / 2;
-            let y = if icon_rect.y - panel_h - GAP >= work.y {
-                icon_rect.y - panel_h - GAP
+    fn compute_panel_rect(&self) -> RECT {
+        let ident = NOTIFYICONIDENTIFIER {
+            cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_UID,
+            ..Default::default()
+        };
+        let mut icon_rc = RECT::default();
+        // SAFETY: Querying the tray icon screen rectangle from the shell.
+        let has_icon_rc = unsafe { Shell_NotifyIconGetRect(&ident, &mut icon_rc) } == 0
+            && icon_rc.right > icon_rc.left
+            && icon_rc.bottom > icon_rc.top;
+
+        let anchor = if has_icon_rc {
+            POINT {
+                x: (icon_rc.left + icon_rc.right) / 2,
+                y: (icon_rc.top + icon_rc.bottom) / 2,
+            }
+        } else {
+            let mut pt = POINT::default();
+            // SAFETY: `pt` is a valid out-pointer.
+            unsafe { GetCursorPos(&mut pt) };
+            pt
+        };
+
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: Querying monitor work area containing `anchor`.
+        unsafe {
+            let hmon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
+            GetMonitorInfoW(hmon, &mut mi);
+        }
+        let work = mi.rcWork;
+
+        // SAFETY: `self.hwnd` is valid; falls back to 96 DPI if 0.
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+        let w = (PANEL_W as f32 * scale).round() as i32;
+        let h = (self.data.panel_height() as f32 * scale).round() as i32;
+        let margin = (8.0 * scale).round() as i32;
+        let gap = (6.0 * scale).round() as i32;
+
+        let (mut x, mut y) = if has_icon_rc {
+            let x = icon_rc.left + ((icon_rc.right - icon_rc.left) - w) / 2;
+            let y = if icon_rc.top - h - gap >= work.top {
+                icon_rc.top - h - gap
             } else {
-                icon_rect.bottom() + GAP
+                icon_rc.bottom + gap
             };
             (x, y)
         } else {
-            (
-                work.right() - PANEL_W - MARGIN,
-                work.bottom() - panel_h - MARGIN,
-            )
+            (work.right - w - margin, work.bottom - h - margin)
         };
+
         x = x.clamp(
-            work.x + MARGIN,
-            (work.right() - PANEL_W - MARGIN).max(work.x + MARGIN),
+            work.left + margin,
+            (work.right - w - margin).max(work.left + margin),
         );
         y = y.clamp(
-            work.y + MARGIN,
-            (work.bottom() - panel_h - MARGIN).max(work.y + MARGIN),
+            work.top + margin,
+            (work.bottom - h - margin).max(work.top + margin),
         );
-        Rect::new(x, y, PANEL_W, panel_h)
+        RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        }
     }
+}
 
-    fn toggle_panel(&mut self) {
-        let visible = self.panel.borrow().is_visible();
-        if visible {
-            self.last_deactivate.set(None);
-            self.panel.borrow_mut().hide();
-            return;
+fn sync_visible_panel(hwnd: HWND) {
+    // SAFETY: `hwnd` is our main window handle; only query tray rect when panel is visible.
+    if unsafe { IsWindowVisible(hwnd) } != 0 {
+        let rect = STATE.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|opt| opt.as_ref().map(AppState::compute_panel_rect))
+        });
+        if let Some(r) = rect {
+            // SAFETY: Resizing/repositioning and invalidating our popup window outside `STATE` borrow.
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    ptr::null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
         }
-        if self
-            .last_deactivate
-            .take()
-            .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
+    }
+}
+
+fn do_apply_data(hwnd: HWND) {
+    STATE.with(|cell| {
+        if let Ok(mut opt) = cell.try_borrow_mut()
+            && let Some(st) = opt.as_mut()
         {
+            st.apply_latest_data();
+        }
+    });
+    sync_visible_panel(hwnd);
+}
+
+fn do_toggle_panel(hwnd: HWND) {
+    // SAFETY: Checking visibility of `hwnd`.
+    if unsafe { IsWindowVisible(hwnd) } != 0 {
+        STATE.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut()
+                && let Some(st) = opt.as_mut()
+            {
+                st.last_deactivate = None;
+            }
+        });
+        // SAFETY: Hiding `hwnd` after dropping `STATE` borrow.
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return;
+    }
+    let recently_deactivated = STATE.with(|cell| {
+        cell.try_borrow_mut().ok().is_some_and(|mut opt| {
+            opt.as_mut().is_some_and(|st| {
+                st.last_deactivate
+                    .take()
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
+            })
+        })
+    });
+    if recently_deactivated {
+        return;
+    }
+    let rect = STATE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|opt| opt.as_ref().map(AppState::compute_panel_rect))
+    });
+    let Some(r) = rect else {
+        return;
+    };
+    // SAFETY: Positioning, showing, and activating `hwnd` immediately using cached `DisplayData`,
+    // then scheduling an async refresh after the window is already visible.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            ptr::null_mut(),
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        InvalidateRect(hwnd, ptr::null(), 0);
+    }
+    wake_worker();
+}
+
+fn do_context_menu(hwnd: HWND) {
+    let icon_mode = STATE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|opt| opt.as_ref().map(|st| st.icon_mode))
+            .unwrap_or(IconMode::Charge)
+    });
+    let mut pt = POINT::default();
+    // SAFETY: Creating a Win32 popup menu, running `TrackPopupMenuEx` with `STATE` unborrowed,
+    // and destroying the menu afterward.
+    let cmd = unsafe {
+        GetCursorPos(&mut pt);
+        let hmenu = CreatePopupMenu();
+        if hmenu.is_null() {
             return;
         }
-        self.refresh();
-        let h = self.data.borrow().panel_height();
-        let rect = self.panel_rect(h);
-        let mut win = self.panel.borrow_mut();
-        win.set_geometry(rect);
-        win.show();
-        let hwnd = win.native_handle() as HWND;
-        // SAFETY: `hwnd` is the live window handle owned by this thread.
-        unsafe {
-            SetForegroundWindow(hwnd);
+        let hsub = CreatePopupMenu();
+        let charge_txt = wide("Charge");
+        let health_txt = wide("Health");
+        AppendMenuW(
+            hsub,
+            MF_STRING,
+            CMD_ICON_CHARGE as usize,
+            charge_txt.as_ptr(),
+        );
+        AppendMenuW(
+            hsub,
+            MF_STRING,
+            CMD_ICON_HEALTH as usize,
+            health_txt.as_ptr(),
+        );
+        let checked_id = match icon_mode {
+            IconMode::Charge => CMD_ICON_CHARGE,
+            IconMode::Health => CMD_ICON_HEALTH,
+        };
+        CheckMenuRadioItem(
+            hsub,
+            CMD_ICON_CHARGE,
+            CMD_ICON_HEALTH,
+            checked_id,
+            MF_BYCOMMAND,
+        );
+
+        let sub_txt = wide("Icon shows");
+        AppendMenuW(hmenu, MF_POPUP, hsub as usize, sub_txt.as_ptr());
+
+        let auto_flags = MF_STRING
+            | if is_autostart_enabled() {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            };
+        let auto_txt = wide("Start with Windows");
+        AppendMenuW(hmenu, auto_flags, CMD_AUTOSTART as usize, auto_txt.as_ptr());
+
+        AppendMenuW(hmenu, MF_SEPARATOR, 0, ptr::null());
+        let quit_txt = wide("Quit");
+        AppendMenuW(hmenu, MF_STRING, CMD_QUIT as usize, quit_txt.as_ptr());
+
+        SetForegroundWindow(hwnd);
+        let selected = TrackPopupMenuEx(
+            hmenu,
+            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            hwnd,
+            ptr::null(),
+        ) as u32;
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(hmenu);
+        selected
+    };
+
+    match cmd {
+        CMD_ICON_CHARGE => STATE.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut()
+                && let Some(st) = opt.as_mut()
+            {
+                st.set_icon_mode(IconMode::Charge);
+            }
+        }),
+        CMD_ICON_HEALTH => STATE.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut()
+                && let Some(st) = opt.as_mut()
+            {
+                st.set_icon_mode(IconMode::Health);
+            }
+        }),
+        CMD_AUTOSTART => set_autostart(!is_autostart_enabled()),
+        CMD_QUIT => {
+            // SAFETY: Posting `WM_CLOSE` to `hwnd`.
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
         }
-        win.activate_window();
+        _ => {}
+    }
+}
+
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_SETCURSOR => {
+            // SAFETY: Setting the shared system arrow cursor.
+            unsafe {
+                SetCursor(LoadCursorW(ptr::null_mut(), IDC_ARROW));
+            }
+            1
+        }
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            // SAFETY: Standard `BeginPaint` / double-buffered GDI `BitBlt` / `EndPaint` sequence.
+            unsafe {
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc);
+                let w = (rc.right - rc.left).max(1);
+                let h = (rc.bottom - rc.top).max(1);
+                let dpi = GetDpiForWindow(hwnd);
+                let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+
+                let mem_dc = CreateCompatibleDC(hdc);
+                let mem_bm = CreateCompatibleBitmap(hdc, w, h);
+                let old_bm = SelectObject(mem_dc, mem_bm);
+                let snapshot = STATE.with(|cell| {
+                    cell.try_borrow()
+                        .ok()
+                        .and_then(|opt| opt.as_ref().map(|st| st.data.clone()))
+                });
+                if let Some(d) = snapshot {
+                    paint_panel_gdi(mem_dc, w, h, scale, &d);
+                }
+                BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+                SelectObject(mem_dc, old_bm);
+                DeleteObject(mem_bm);
+                DeleteDC(mem_dc);
+                EndPaint(hwnd, &ps);
+            }
+            0
+        }
+        WM_ACTIVATE => {
+            // SAFETY: Hiding `hwnd` on focus loss after recording timestamp.
+            if (wparam & 0xFFFF) as u32 == WA_INACTIVE && unsafe { IsWindowVisible(hwnd) } != 0 {
+                STATE.with(|cell| {
+                    if let Ok(mut opt) = cell.try_borrow_mut()
+                        && let Some(st) = opt.as_mut()
+                    {
+                        st.last_deactivate = Some(Instant::now());
+                    }
+                });
+                unsafe {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if wparam as u16 == VK_ESCAPE {
+                STATE.with(|cell| {
+                    if let Ok(mut opt) = cell.try_borrow_mut()
+                        && let Some(st) = opt.as_mut()
+                    {
+                        st.last_deactivate = None;
+                    }
+                });
+                // SAFETY: Hiding `hwnd` on Escape key.
+                unsafe {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+            0
+        }
+        WM_DPICHANGED => {
+            sync_visible_panel(hwnd);
+            0
+        }
+        WM_TRAY_CALLBACK => {
+            let ev = (lparam & 0xFFFF) as u32;
+            match ev {
+                NIN_SELECT | NIN_KEYSELECT => do_toggle_panel(hwnd),
+                WM_CONTEXTMENU => do_context_menu(hwnd),
+                _ => {}
+            }
+            0
+        }
+        WM_TIMER => {
+            if wparam == TIMER_SETTLE {
+                // SAFETY: Stopping the one-shot settle timer.
+                unsafe {
+                    KillTimer(hwnd, TIMER_SETTLE);
+                }
+            }
+            wake_worker();
+            0
+        }
+        WM_POWERBROADCAST => {
+            let wp = wparam as u32;
+            if wp == PBT_APMPOWERSTATUSCHANGE
+                || wp == PBT_POWERSETTINGCHANGE
+                || wp == PBT_APMRESUMEAUTOMATIC
+            {
+                wake_worker();
+                // SAFETY: Scheduling a follow-up refresh 800 ms later once EC wattage settles.
+                unsafe {
+                    SetTimer(hwnd, TIMER_SETTLE, SETTLE_MS, None);
+                }
+            }
+            1
+        }
+        WM_APP_DATA_READY => {
+            do_apply_data(hwnd);
+            0
+        }
+        WM_CLOSE => {
+            STATE.with(|cell| {
+                if let Ok(mut opt) = cell.try_borrow_mut()
+                    && let Some(st) = opt.as_mut()
+                {
+                    st.remove_tray();
+                }
+            });
+            // SAFETY: Default handling destroys the window.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_DESTROY => {
+            // SAFETY: Posting `WM_QUIT` to end the message loop.
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
+        _ => {
+            let redraw_tray = STATE.with(|cell| {
+                cell.try_borrow().ok().is_some_and(|opt| {
+                    opt.as_ref().is_some_and(|st| {
+                        st.taskbar_created_msg != 0 && msg == st.taskbar_created_msg
+                    })
+                })
+            });
+            if redraw_tray {
+                STATE.with(|cell| {
+                    if let Ok(mut opt) = cell.try_borrow_mut()
+                        && let Some(st) = opt.as_mut()
+                    {
+                        st.add_tray_icon();
+                    }
+                });
+                return 0;
+            }
+            // SAFETY: Forwarding unhandled messages to `DefWindowProcW`.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
     }
 }
 
 fn main() {
-    ferrokit_platform::set_dpi_awareness();
-    let mut app = Application::new(vec!["batlens-gui".to_string()]);
-    GuiApplication::set_quit_on_last_window_closed(false);
-    if !SystemTrayIcon::is_system_tray_available() {
+    // SAFETY: Enabling Per-Monitor V2 DPI awareness before creating any windows.
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    enable_dark_menus();
+
+    let class_name = wide("BatlensTrayPanelWindow");
+    let title = wide("batlens");
+    // SAFETY: Registering the window class and creating the hidden popup/tray owner window.
+    let hwnd = unsafe {
+        let hinstance = GetModuleHandleW(ptr::null());
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinstance,
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            lpszClassName: class_name.as_ptr(),
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            hinstance,
+            ptr::null(),
+        )
+    };
+    if hwnd.is_null() {
         return;
     }
 
-    let data = Rc::new(RefCell::new(DisplayData::default()));
-    let last_deactivate = Rc::new(Cell::new(None));
+    let taskbar_msg_name = wide("TaskbarCreated");
+    // SAFETY: Registering `TaskbarCreated` message to re-add tray icon if Explorer restarts.
+    let taskbar_created_msg = unsafe { RegisterWindowMessageW(taskbar_msg_name.as_ptr()) };
 
-    let init_rect = Rect::new(0, 0, PANEL_W, 190);
-    let Ok(mut window) = Window::new(
-        "batlens",
-        init_rect,
-        WindowFlags::FRAMELESS
-            | WindowFlags::TOOL
-            | WindowFlags::STAYS_ON_TOP
-            | WindowFlags::LAYERED,
-    ) else {
-        return;
+    let cached_wear_hit = if let Some(w) = try_cached_wear_text() {
+        let _ = WEAR_TEXT.set(w);
+        true
+    } else {
+        false
     };
 
-    let mut root_widget = EmptyWidget::with_geometry(init_rect);
-    root_widget
-        .widget_base()
-        .set_focus_policy(FocusPolicy::StrongFocus);
-    let paint_data = Rc::clone(&data);
-    root_widget.set_paint_handler(move |painter| {
-        paint_panel(painter, &paint_data.borrow());
-    });
-    let root: WidgetRef = Rc::new(RefCell::new(Box::new(root_widget)));
-    window.set_root_widget(Rc::clone(&root));
+    let initial_data = batlens_core::sys::sample()
+        .map(|s| DisplayData::from_sample(&s))
+        .unwrap_or_default();
 
-    let panel = Rc::new(RefCell::new(window));
-    let deact_panel = Rc::clone(&panel);
-    let deact_time = Rc::clone(&last_deactivate);
-    panel
-        .borrow_mut()
-        .set_window_event_handler(move |ev: &mut Event| {
-            if matches!(ev.kind, EventKind::WindowDeactivate) {
-                deact_time.set(Some(Instant::now()));
-                if let Ok(mut w) = deact_panel.try_borrow_mut()
-                    && w.is_visible()
-                {
-                    w.hide();
+    // SAFETY: Pre-warming IME/focus state, GDI `Segoe UI` fonts, and popup menu tables before
+    // registering the tray icon so the first left/right click has zero cold-start latency.
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        ShowWindow(hwnd, SW_HIDE);
+        let hdc = GetDC(hwnd);
+        if !hdc.is_null() {
+            let mem_dc = CreateCompatibleDC(hdc);
+            let mem_bm = CreateCompatibleBitmap(hdc, 4, 4);
+            let old_bm = SelectObject(mem_dc, mem_bm);
+            paint_panel_gdi(mem_dc, 4, 4, 1.0, &initial_data);
+            SelectObject(mem_dc, old_bm);
+            DeleteObject(mem_bm);
+            DeleteDC(mem_dc);
+            ReleaseDC(hwnd, hdc);
+        }
+        let hm = CreatePopupMenu();
+        if !hm.is_null() {
+            DestroyMenu(hm);
+        }
+        let mut msg: MSG = std::mem::zeroed();
+        PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_NOREMOVE);
+    }
+
+    let mut state = AppState {
+        hwnd,
+        hicon: ptr::null_mut(),
+        last_icon_spec: None,
+        last_tip: String::new(),
+        data: initial_data,
+        icon_mode: load_icon_mode(),
+        warned: false,
+        last_deactivate: None,
+        taskbar_created_msg,
+    };
+    state.add_tray_icon();
+    STATE.with(|cell| {
+        *cell.borrow_mut() = Some(state);
+    });
+
+    // SAFETY: Registering AC/DC power notification on `hwnd`.
+    let _power_notify =
+        unsafe { RegisterPowerSettingNotification(hwnd, &GUID_ACDC_POWER_SOURCE, 0) };
+
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
+    let _ = POLL_WAKE.set(tx);
+    let worker_hwnd = hwnd as isize;
+    std::thread::spawn(move || {
+        let push_sample = || {
+            if let Ok(s) = batlens_core::sys::sample() {
+                let d = DisplayData::from_sample(&s);
+                *LATEST_DATA.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+                // SAFETY: `PostMessageW` is thread-safe and posts `WM_APP_DATA_READY` to `hwnd`.
+                unsafe {
+                    PostMessageW(worker_hwnd as HWND, WM_APP_DATA_READY, 0, 0);
                 }
             }
-        });
-
-    let hide_timer = Timer::new();
-    hide_timer.set_single_shot(true);
-    let esc_panel = Rc::clone(&panel);
-    let esc_time = Rc::clone(&last_deactivate);
-    hide_timer.timeout.connect_local(move |_| {
-        esc_time.set(None);
-        if let Ok(mut w) = esc_panel.try_borrow_mut()
-            && w.is_visible()
-        {
-            w.hide();
-        }
-    });
-    let filter = EscFilter {
-        data: ObjectData::with_auto_id(),
-        hide_timer,
-    };
-    // SAFETY: `_esc_owner` lives on the main thread for the entire duration of `main`.
-    let _esc_owner = unsafe { register_owned_qobject(filter) };
-    root.borrow_mut()
-        .object_data_mut()
-        .install_event_filter(ferrokit_core::object::OwnedObject::object_id(&_esc_owner));
-
-    let initial_mode = load_icon_mode();
-    let menu: MenuRef = Menu::new_ref("batlens");
-    let icon_menu = menu.borrow_mut().add_menu("Icon shows");
-    let charge_act: ActionRef = icon_menu.borrow_mut().add_new_action("Charge");
-    let health_act: ActionRef = icon_menu.borrow_mut().add_new_action("Health");
-    charge_act.borrow_mut().set_checkable(true);
-    health_act.borrow_mut().set_checkable(true);
-    let mut mode_group = ActionGroup::new();
-    mode_group.add_action(&charge_act);
-    mode_group.add_action(&health_act);
-    charge_act
-        .borrow_mut()
-        .set_checked(initial_mode == IconMode::Charge);
-    health_act
-        .borrow_mut()
-        .set_checked(initial_mode == IconMode::Health);
-    let autostart_act = menu.borrow_mut().add_new_action("Start with Windows");
-    autostart_act.borrow_mut().set_checkable(true);
-    autostart_act
-        .borrow_mut()
-        .set_checked(is_autostart_enabled());
-
-    menu.borrow_mut().add_separator();
-    let quit = menu.borrow_mut().add_new_action("Quit");
-    quit.borrow().triggered.connect(|_| Application::quit());
-
-    let Ok(mut icon) = SystemTrayIcon::from_icon(&make_icon(None, [90, 90, 90])) else {
-        return;
-    };
-    icon.set_context_menu(Rc::clone(&menu));
-    let _ = icon.show();
-    let tray = Rc::new(RefCell::new(Tray {
-        icon,
-        panel,
-        data,
-        last_deactivate,
-        icon_mode: initial_mode,
-        warned: false,
-    }));
-    tray.borrow_mut().refresh();
-
-    let t_act = Rc::clone(&tray);
-    tray.borrow()
-        .icon
-        .activated
-        .connect_local(move |reason: &ActivationReason| {
-            if matches!(reason, ActivationReason::Trigger) {
-                t_act.borrow_mut().toggle_panel();
-            }
-        });
-
-    let t_charge = Rc::clone(&tray);
-    charge_act.borrow().triggered.connect_local(move |_| {
-        t_charge.borrow_mut().set_icon_mode(IconMode::Charge);
-    });
-    let t_health = Rc::clone(&tray);
-    health_act.borrow().triggered.connect_local(move |_| {
-        t_health.borrow_mut().set_icon_mode(IconMode::Health);
-    });
-    autostart_act
-        .borrow()
-        .triggered
-        .connect_local(|checked: &bool| {
-            set_autostart(*checked);
-        });
-    let auto_sync = Rc::clone(&autostart_act);
-    let charge_sync = Rc::clone(&charge_act);
-    let health_sync = Rc::clone(&health_act);
-    let t_sync = Rc::clone(&tray);
-    menu.borrow().about_to_show.connect_local(move |_| {
-        auto_sync.borrow_mut().set_checked(is_autostart_enabled());
-        let mode = t_sync.borrow().icon_mode;
-        charge_sync
-            .borrow_mut()
-            .set_checked(mode == IconMode::Charge);
-        health_sync
-            .borrow_mut()
-            .set_checked(mode == IconMode::Health);
-    });
-
-    let fast_timer = Timer::new();
-    fast_timer.set_single_shot(true);
-    let t_fast = Rc::clone(&tray);
-    fast_timer
-        .timeout
-        .connect_local(move |_| t_fast.borrow_mut().refresh());
-
-    let settle_timer = Timer::new();
-    settle_timer.set_single_shot(true);
-    let t_settle = Rc::clone(&tray);
-    settle_timer
-        .timeout
-        .connect_local(move |_| t_settle.borrow_mut().refresh());
-
-    EVENT_TIMERS.with(|cell| {
-        *cell.borrow_mut() = Some((fast_timer, settle_timer));
-    });
-
-    let panel_hwnd = tray.borrow().panel.borrow().native_handle() as HWND;
-    // SAFETY: `panel_hwnd` is a valid main-thread window handle; subclassing intercepts
-    // `WM_POWERBROADCAST` and `WM_APP_WEAR_READY` and forwards everything else.
-    let _power_notify = unsafe {
-        let prev = SetWindowLongPtrW(
-            panel_hwnd,
-            GWLP_WNDPROC,
-            power_wnd_proc as *const () as usize as isize,
-        );
-        ORIG_WNDPROC.store(prev, Ordering::Relaxed);
-        RegisterPowerSettingNotification(panel_hwnd, &GUID_ACDC_POWER_SOURCE, 0)
-    };
-
-    let wear_hwnd = panel_hwnd as isize;
-    std::thread::spawn(move || {
-        if let Some(w) = compute_wear_text() {
+        };
+        if !cached_wear_hit && let Some(w) = generate_wear_text() {
             let _ = WEAR_TEXT.set(w);
-            // SAFETY: `PostMessageW` is thread-safe and posts a notification message to `panel_hwnd`.
-            unsafe {
-                PostMessageW(wear_hwnd as HWND, WM_APP_WEAR_READY, 0, 0);
-            }
+            push_sample();
+        }
+        loop {
+            let _ = rx.recv_timeout(Duration::from_millis(u64::from(POLL_MS)));
+            push_sample();
         }
     });
-
-    let timer = Timer::new();
-    timer.set_interval(POLL_MS);
-    let t_poll = Rc::clone(&tray);
-    timer
-        .timeout
-        .connect_local(move |_| t_poll.borrow_mut().refresh());
-    timer.start();
-
-    let exit_code = app.exec();
-    drop(mode_group);
-    std::process::exit(exit_code);
+    // SAFETY: Standard Win32 message loop for the main GUI thread.
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
 }
